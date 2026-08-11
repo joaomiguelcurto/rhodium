@@ -1,5 +1,5 @@
-// procmap figures out which process owns a given local TCP port,
-// by asking Windows for its connection table.
+// procmap figures out which process owns a given local port
+// by using iphlpapi.dll (Windows network library)
 package procmap
 
 import (
@@ -8,6 +8,9 @@ import (
 	"unsafe"
 )
 
+// loads the DLL and handles the one function we need,
+// GetExtendedTcpTable, "Lazy" means it doesnt actually get used
+// until we call it the first time
 var (
 	iphlpapi           = syscall.NewLazyDLL("iphlpapi.dll")
 	procGetExtTCPTable = iphlpapi.NewProc("GetExtendedTcpTable")
@@ -31,7 +34,7 @@ const (
 	errInsufficientBuffer = 122 // expected on the first call, not a real error
 )
 
-// PortOwner returns the PID currently holding the given local TCP port.
+// PortOwner returns the PID currently holding the given local port.
 func PortOwner(localPort uint16) (uint32, error) {
 	// classic Windows two-call dance: first call just asks "how big should my buffer be?"
 	// pattern explained here: https://learn.microsoft.com/en-us/windows/win32/api/iphlpapi/nf-iphlpapi-getextendedtcptable#remarks
@@ -65,6 +68,57 @@ func PortOwner(localPort uint16) (uint32, error) {
 	return parseTCPTable(buf, localPort)
 }
 
+// PortTable returns a snapshot of every local port currently mapped to
+// its owning PID. Building this once and reusing it for a short window is
+// much cheaper than calling PortOwner per-packet, which rebuilds the whole
+// table from scratch every single time.
+func PortTable() (map[uint16]uint32, error) {
+	var size uint32
+	ret, _, _ := procGetExtTCPTable.Call(
+		0,
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		uintptr(afInet),
+		uintptr(tcpTableOwnerPidAll),
+		0,
+	)
+	if ret != 0 && ret != errInsufficientBuffer {
+		return nil, fmt.Errorf("GetExtendedTcpTable size query failed: code %d", ret)
+	}
+
+	buf := make([]byte, size)
+	ret, _, _ = procGetExtTCPTable.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		uintptr(afInet),
+		uintptr(tcpTableOwnerPidAll),
+		0,
+	)
+	if ret != 0 {
+		return nil, fmt.Errorf("GetExtendedTcpTable fetch failed: code %d", ret)
+	}
+
+	numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
+	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
+	base := uintptr(unsafe.Pointer(&buf[0])) + 4
+
+	table := make(map[uint16]uint32, numEntries)
+	for i := uint32(0); i < numEntries; i++ {
+		row := (*mibTCPRowOwnerPID)(unsafe.Pointer(base + uintptr(i)*rowSize))
+
+		lo := byte(row.LocalPort)
+		hi := byte(row.LocalPort >> 8)
+		port := uint16(lo)<<8 | uint16(hi)
+
+		table[port] = row.OwningPid
+	}
+
+	return table, nil
+}
+
+// parseTCPTable guides the raw byte buffer received from Windows API
+// row by row, manually reading memory offsets, looking for the row matching our port.
 func parseTCPTable(buf []byte, localPort uint16) (uint32, error) {
 	numEntries := *(*uint32)(unsafe.Pointer(&buf[0]))
 	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})

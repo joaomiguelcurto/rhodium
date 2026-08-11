@@ -1,3 +1,5 @@
+// procname figures out, given a PID,
+// what is the process name
 package procmap
 
 import (
@@ -7,6 +9,9 @@ import (
 	"unsafe"
 )
 
+// loads the DLL and handles the functions we need,
+// "Lazy" means it doesnt actually get used
+// until we call it the first time
 var (
 	kernel32                      = syscall.NewLazyDLL("kernel32.dll")
 	procOpenProcess               = kernel32.NewProc("OpenProcess")
